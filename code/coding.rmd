@@ -1,0 +1,54 @@
+---
+title: "script coding"
+author: "Clint McKenna"
+date: "7/17/2024"
+output: html_document
+---
+
+# data prep
+```{r}
+# load packages
+library(tidyverse)
+
+# read in data
+dat <- read_csv('../data/combined.csv')
+
+# code republican/democrat
+dat <- dat %>%
+  mutate(party = case_when(
+    speaker == 'BIDEN' ~ 'Democrat',
+    speaker == 'BUSH' ~ 'Republican',
+    speaker == 'CLINTON' ~ 'Democrat',
+    speaker == 'KERRY' ~ 'Democrat',
+    speaker == 'MCCAIN' ~ 'Republican',
+    speaker == 'OBAMA' ~ 'Democrat',
+    speaker == 'ROMNEY' ~ 'Republican',
+    speaker == 'TRUMP' ~ 'Republican'))
+
+```
+
+# count characters and filter
+```{r}
+# count and filter out text less than 240 characters
+dat <- dat %>%
+  mutate(n_char = nchar(text)) %>%
+  filter(n_char > 240)
+
+```
+
+# write to file
+```{r}
+# save csv
+write_csv(dat, '../data/coding_text.csv')
+
+```
+
+
+
+
+
+
+
+
+
+

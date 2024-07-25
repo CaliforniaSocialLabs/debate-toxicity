@@ -1,0 +1,2235 @@
+---
+title: "script parsing"
+author: "Clint McKenna"
+date: "7/5/2024"
+output: html_document
+---
+
+# data prep
+```{r}
+# load packages
+library(rvest)
+library(tidytext)
+library(httr)
+library(jsonlite)
+library(tidyverse)
+
+# define api key
+# set with Sys.setenv(PERSPECTIVE_API = 'value'), or just paste here
+api_key <- Sys.getenv("PERSPECTIVE_API")
+
+# function to get perspective api scores using curl
+score_text <- function(text, api_key, attributes) {
+  url <- 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze'
+  
+  # Create a correctly formatted requestedAttributes object
+  requested_attributes <- lapply(attributes, function(attr) {
+    list(scoreType = 'PROBABILITY', scoreThreshold = 0)
+  })
+  names(requested_attributes) <- attributes
+  
+  payload <- list(
+    comment = list(text = text),
+    languages = list('en'),
+    requestedAttributes = requested_attributes
+  )
+  
+  tryCatch({
+    response <- POST(
+      url = url,
+      query = list(key = api_key),
+      body = toJSON(payload, auto_unbox = TRUE),
+      add_headers('Content-Type' = 'application/json')
+    )
+    
+    if (status_code(response) == 200) {
+      content <- content(response, 'parsed')
+      scores <- sapply(attributes, function(attr) {
+        content$attributeScores[[attr]]$summaryScore$value
+      })
+      # change to dataframe
+      scores <- as.data.frame(t(scores))
+      return(scores)
+    } else {
+      warning('Error: ', status_code(response), ' - ', content(response, 'text'))
+      return(setNames(rep(NA, length(attributes)), attributes))
+    }
+  }, error = function(e) {
+    warning('An error occurred: ', e$message)
+    return(setNames(rep(NA, length(attributes)), attributes))
+  })
+}
+
+```
+
+# 2024-06-27
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.cnn.com/2024/06/27/politics/read-biden-trump-debate-rush-transcript/index.html'
+html <- read_html(url)
+
+```
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('.vossi-paragraph-primary-core-light') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('JAKE TAPPER, CNN MODERATOR', 'TAPPER', 'DANA BASH, CNN MODERATOR', 'BASH', 'JOE BIDEN, PRESIDENT OF THE UNITED STATES', 'BIDEN', 'DONALD TRUMP, FORMER PRESIDENT OF THE UNITED STATES AND CURRENT U.S. PRESIDENTIAL CANDIDATE', 'TRUMP') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('\n', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]COMMERCIAL BREAK[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text))
+
+
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# rename speakers
+rawText <- rawText %>%
+  mutate(speaker = gsub('JOE BIDEN, PRESIDENT OF THE UNITED STATES', 'BIDEN', speaker)) %>%
+  mutate(speaker = gsub('DONALD TRUMP, FORMER PRESIDENT OF THE UNITED STATES AND CURRENT U.S. PRESIDENTIAL CANDIDATE', 'TRUMP', speaker)) 
+
+# filter out only biden/trump
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('BIDEN', 'TRUMP'))
+
+# drop empty rows
+rawText <- rawText %>%
+  filter(text != '.')
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2024a.csv')
+
+```
+
+
+# 2020-09-29
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/september-29-2020-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('WALLACE', 'BIDEN', 'TRUMP') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[[]crosstalk[]]', '', text)) %>%
+  mutate(text = gsub('[[]unintelligible[]]', '', text)) %>%
+  mutate(text = gsub('[[]to Biden[]]', '', text)) %>%
+
+  mutate(text = gsub('[[]laughing[]]', '', text))
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only biden/trump
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('BIDEN', 'TRUMP'))
+
+# drop empty rows
+rawText <- rawText %>%
+  filter(text != '.') %>%
+  filter(text != '')
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2020a.csv')
+
+```
+
+
+
+# 2020-10-22
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-22-2020-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('WELKER', 'BIDEN', 'TRUMP') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only biden/trump
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('BIDEN', 'TRUMP'))
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2020b.csv')
+
+```
+
+
+# 2016-09-26
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/september-26-2016-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('HOLT', 'CLINTON', 'TRUMP') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[[]applause[]]', '', text)) %>%
+  mutate(text = gsub('[[]crosstalk[]]', '', text)) %>%
+  mutate(text = gsub('[[]laughter[]]', '', text))
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only clinton/trump
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('CLINTON', 'TRUMP'))
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2016a.csv')
+
+```
+
+
+
+# 2016-10-09
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-9-2016-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('RADDATZ', 'COOPER', 'CLINTON', 'TRUMP') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[[]applause[]]', '', text)) %>%
+  mutate(text = gsub('[[]crosstalk[]]', '', text)) %>%
+  mutate(text = gsub('[[]laughter[]]', '', text))
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only clinton/trump
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('CLINTON', 'TRUMP'))
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2016b.csv')
+
+```
+
+
+
+
+# 2016-10-19
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-19-2016-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('WALLACE', 'CLINTON', 'TRUMP') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[[]applause[]]', '', text)) %>%
+  mutate(text = gsub('[[]crosstalk[]]', '', text)) %>%
+  mutate(text = gsub('[[]laughter[]]', '', text))
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only clinton/trump
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('CLINTON', 'TRUMP'))
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2016c.csv')
+
+```
+
+
+
+
+# 2012-10-03
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-3-2012-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('LEHRER', 'OBAMA', 'ROMNEY')
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# manually fix row 14-15
+rawText[14, 'text'] <- paste(rawText[14, 'text'], rawText[15, 'speaker'], sep = ' ')
+rawText[15, 'speaker'] <- 'LEHRER'
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text))
+  
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only obama/romney
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('OBAMA', 'ROMNEY'))
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2012a.csv')
+
+```
+
+
+
+
+# 2012-10-16
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-16-2012-the-second-obama-romney-presidential-debate/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('CROWLEY', 'OBAMA', 'ROMNEY', 'QUESTION') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# manually fix row 13-14
+rawText[13, 'text'] <- paste(rawText[13, 'text'], 'Go Ahead.', sep = ' ')
+rawText[14, 'speaker'] <- 'OBAMA'
+
+# manually fix row 24-25
+rawText[24, 'text'] <- paste(rawText[24, 'text'], 'This is about bringing good jobs back for the middle class of America, and that’s what I’m going to do.', sep = ' ')
+rawText[25, 'speaker'] <- 'CROWLEY'
+
+# manually fix row 101-102
+rawText[101, 'text'] <- paste(rawText[101, 'text'], 'An economy with 50 percent of kids graduating from college that can’t finds a job, or a college level job, that’s not what we have to have. ', sep = ' ')
+rawText[102, 'speaker'] <- 'CROWLEY'
+
+
+# manually fix row 210-211
+rawText[210, 'text'] <- paste(rawText[210, 'text'], 'I’d like to understand who it was that did this, what the idea was behind it, why it led to the violence, thousands of guns going to Mexican drug lords. ', sep = ' ')
+rawText[211, 'speaker'] <- 'OBAMA'
+
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only obama/romney
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('OBAMA', 'ROMNEY'))
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2012b.csv')
+
+```
+
+
+
+
+# 2012-10-22
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-22-2012-the-third-obama-romney-presidential-debate/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+# including misspelling
+speakers <- c('SCHIEFFER', 'OBAMA', 'OBAM', 'ROMNEY') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# manually fix row 41-42
+rawText[41, 'text'] <- paste(rawText[41, 'text'], 'And I am confident that Assad’s days are numbered. But what we can’t do is to simply suggest that, as Governor Romney at times has suggested, that giving heavy weapons, for example, to the Syrian opposition is a simple proposition that would lead us to be safer over the long term.', sep = ' ')
+rawText[42, 'speaker'] <- 'SCHIEFFER'
+
+# manually fix row 186
+rawText[186, 'text'] <- gsub('OBAMA.*', '', rawText[186, 'text'])
+tmp <- data.frame(group = 185.5,
+                  speaker = 'OBAMA',
+                  text = 'The — look, I think anybody out there can check the record. Governor Romney, you keep on trying to, you know airbrush history here. You were very clear that you would not provide, government assistance to the U.S. auto companies, even if they went through bankruptcy. You said that they could get it in the private marketplace. That wasn’t true. They would have gone through a...')
+rawText <- bind_rows(rawText, tmp)
+
+# fix obama misspelling
+rawText <- rawText %>%
+  mutate(speaker = case_when(
+    speaker == 'OBAM' ~ 'OBAMA',
+    TRUE ~ speaker))
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(speaker = gsub('[(]CROSSTALK[)]', '', speaker)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only obama/romney
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('OBAMA', 'ROMNEY'))
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2012c.csv')
+
+```
+
+
+
+# 2008-09-26
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/2008-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('LEHRER', 'OBAMA', 'MCCAIN') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only obama/mccain
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('OBAMA', 'MCCAIN'))
+
+
+# filter out after group 188, which repeats the script
+rawText <- rawText %>%
+  filter(group < 189)
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2008a.csv')
+
+```
+
+
+
+
+
+# 2008-10-07
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-7-2008-debate-transcrip/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('BROKAW', 'OBAMA', 'MCCAIN') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+
+# manually fix row 136-137
+rawText[136, 'text'] <- paste(rawText[136, 'text'], 'Thank you. ', sep = ' ')
+rawText[137, 'speaker'] <- 'BROKAW'
+
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only obama/mccain
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('OBAMA', 'MCCAIN'))
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2008b.csv')
+
+```
+
+
+
+# 2008-10-15
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-15-2008-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('SCHIEFFER', 'OBAMA', 'MCCAIN') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+
+# manually fix row 17
+rawText[17, 'text'] <- gsub('OBAMA.*', '', rawText[17, 'text'])
+tmp <- data.frame(group = 16.5,
+                  speaker = 'OBAMA',
+                  text = '...in order to give — in order to give additional tax cuts to Joe the plumber before he was at the point where he could make $250,000.
+
+Then Exxon Mobil, which made $12 billion, record profits, over the last several quarters, they can afford to pay a little more so that ordinary families who are hurting out there — they’re trying to figure out how they’re going to afford food, how they’re going to save for their kids’ college education, they need a break.
+
+So, look, nobody likes taxes. I would prefer that none of us had to pay taxes, including myself. But ultimately, we’ve got to pay for the core investments that make this economy strong and somebody’s got to do it.')
+rawText <- bind_rows(rawText, tmp)
+
+# manually fix row 107-108
+rawText[107, 'text'] <- paste(rawText[107, 'text'], 'And I believe the first question goes to you, Senator McCain. ', sep = ' ')
+rawText[108, 'speaker'] <- 'MCCAIN'
+
+# manually fix row 67
+rawText[67, 'text'] <- gsub('MCCAIN.*', '', rawText[67, 'text'])
+tmp <- data.frame(group = 67.5,
+                  speaker = 'MCCAIN',
+                  text = 'You’ve got to read what he said.')
+rawText <- bind_rows(rawText, tmp)
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only obama/mccain
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('OBAMA', 'MCCAIN'))
+
+# arrange by group
+rawText <- rawText %>%
+  arrange(group)
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2008c.csv')
+
+```
+
+
+
+
+
+# 2004-09-30
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/september-30-2004-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('LEHRER', 'KERRY', 'BUSH') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+
+# manually fix row 87-88
+rawText[87, 'text'] <- paste(rawText[87, 'text'], 'What is your position on the whole concept of preemptive war?', sep = ' ')
+rawText[88, 'speaker'] <- 'KERRY'
+
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(speaker = gsub('[(]CROSSTALK[)]', '', speaker)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only kerry/bush
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('KERRY', 'BUSH'))
+
+# arrange by group
+rawText <- rawText %>%
+  arrange(group)
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2004a.csv')
+
+```
+
+
+
+
+# 2004-10-08
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-8-2004-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('GIBSON', 'KERRY', 'BUSH', 'OTIS', 'DAHLE', 'BALDI', 'WASHINGTON', 'JACOBS', 'FARLEY', 'BRONSING', 'HORSTMAN', 'LAURENT', 'O’BRIEN', 'VARNER', 'HUBB', 'BARROW', 'FOWLER', 'LONG', 'MICHAELSON', 'DEGENHART', 'GRABEL') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]OFF-MIKE[)]', '', text)) %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(speaker = gsub('[(]CROSSTALK[)]', '', speaker)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only kerry/bush
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('KERRY', 'BUSH'))
+
+# arrange by group
+rawText <- rawText %>%
+  arrange(group)
+
+# remove empty row
+rawText <- rawText %>%
+  filter(text != '')
+
+```
+
+## score toxicity
+```{r}
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2004b.csv')
+
+```
+
+
+# 2004-10-13
+
+## get url
+```{r}
+# specify url and html
+url <- 'https://www.debates.org/voter-education/debate-transcripts/october-13-2004-debate-transcript/'
+html <- read_html(url)
+
+```
+
+
+
+## parse text 
+```{r}
+
+# grab full text
+rawText <- html %>%
+  html_nodes('p') %>%
+  html_text() %>%
+  as.data.frame()
+names(rawText) <- 'text'
+
+# vector of speakers appearing in transcript
+speakers <- c('SCHIEFFER', 'KERRY', 'BUSH') 
+speakers <- paste0(speakers, ':')
+speakers <- paste(speakers, collapse = '|')
+  
+# detect and extract speakers
+rawText <- rawText %>%
+  mutate(is_speaker = str_detect(text, speakers)) %>%
+  mutate(group = cumsum(is_speaker)) %>%
+  mutate(speaker = if_else(is_speaker, 
+                           str_extract(text, '^[^:]+'), 
+                           NA_character_)) %>%
+  fill(speaker) %>%
+    mutate(text = if_else(is_speaker, 
+                        str_remove(text, '^[^:]+:\\s*'), 
+                        text))
+
+# group lines by speaker
+rawText <- rawText %>%
+  group_by(group) %>%
+  # Combine all text for each speaker segment
+  summarize(
+    speaker = first(speaker),
+    text = paste(text, collapse = ' '),
+    .groups = 'drop'
+  ) 
+
+
+# manually fix rows 69-70
+rawText[69, 'text'] <- paste(rawText[69, 'text'], 'And thirdly, we need an earned-legalization program for people who have been here for a long time, stayed out of trouble, got a job, paid their taxes, and their kids are American. We got to start moving them toward full citizenship, out of the shadows. ', sep = ' ')
+rawText[70, 'speaker'] <- 'SCHIEFFER'
+
+
+
+# remove html characters and transcript notes
+rawText <- rawText %>%
+  mutate(text = gsub('[(]OFF-MIKE[)]', '', text)) %>%
+  mutate(text = gsub('[(]APPLAUSE[)]', '', text)) %>%
+  mutate(text = gsub('[(]ph[)]', '', text)) %>%
+  mutate(text = gsub('[(]sic[)]', '', text)) %>%
+  mutate(text = gsub('[(]inaudible[)]', '', text)) %>%
+  mutate(text = gsub('[(]CROSSTALK[)]', '', text)) %>%
+  mutate(speaker = gsub('[(]CROSSTALK[)]', '', speaker)) %>%
+  mutate(text = gsub('[(]LAUGHTER[)]', '', text))
+
+  
+# trim whitespace
+rawText <- rawText %>%
+  mutate(speaker = gsub('\\s+', ' ', speaker)) %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = gsub('\\s+', ' ', text)) %>%
+  mutate(text = str_trim(text))
+
+# filter out only kerry/bush
+rawText <- rawText %>%
+  mutate(speaker = str_trim(speaker)) %>%
+  mutate(text = str_trim(text)) %>%
+  filter(speaker %in% c('KERRY', 'BUSH'))
+
+# arrange by group
+rawText <- rawText %>%
+  arrange(group)
+
+```
+
+## score toxicity
+```{r}
+
+
+# create text id
+text <- rawText %>%
+  mutate(textId = 1:n()) %>%
+  select(textId, speaker, text)
+
+# score toxicity
+n <- as.numeric(nrow(text))
+textList <- list()
+for (i in 1:n) {
+  # current text row
+  currentRow <- text[i,]
+  
+  # current id and text
+  currentId <- as.numeric(currentRow$textId)
+  currentText <- currentRow$text
+  
+  # perspective scores
+  currentScores <- score_text(
+    currentText,
+    api_key,
+    attributes = c(
+      'TOXICITY',
+      'AFFINITY_EXPERIMENTAL',
+      'COMPASSION_EXPERIMENTAL',
+      'CURIOSITY_EXPERIMENTAL',
+      'NUANCE_EXPERIMENTAL',
+      'PERSONAL_STORY_EXPERIMENTAL',
+      'REASONING_EXPERIMENTAL',
+      'RESPECT_EXPERIMENTAL'
+    )) %>%
+    mutate(textId = currentId)
+  
+  # output
+  output <- left_join(currentRow, currentScores, by = 'textId')
+  
+  # add to list
+  textList[[i]] <- output
+
+}
+
+# combine row dataframes
+text <- do.call('bind_rows', textList)
+
+# remove clutter
+rm(currentId, currentRow, currentText, currentScores, textList, i, n)
+
+```
+
+## write to file
+```{r}
+# write as csv
+write_csv(text, '../data/2004c.csv')
+
+```
+
+
+# combine files into dataframe
+```{r}
+
+# list of files
+files <- list.files('../data', pattern = '*.csv', full.names = TRUE)
+
+# combine files
+combined <- files %>%
+  map_df(~ {
+   tmp <- read_csv(.)
+   tmp$file <- basename(.)
+   return(tmp)
+  })
+
+# remove .csv from filename
+combined <- combined %>%
+  mutate(file = gsub('.csv', '', file))
+
+# separate year and debate within each year
+combined <- combined %>%
+  mutate(year = str_extract(file, '^\\d{4}')) %>%
+  mutate(debate = str_extract(file, '[a-z]$')) %>%
+  mutate(debate = toupper(debate)) %>%
+  select(-file)
+
+# reorder vars
+combined <- combined %>%
+  select(year, debate, textId, speaker, text, everything())
+
+
+# write csv
+write_csv(combined, "../data/combined.csv")
+
+
+```
+
+
+

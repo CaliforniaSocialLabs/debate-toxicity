@@ -1,0 +1,321 @@
+---
+title: "figures"
+author: "Clint McKenna"
+date: "7/17/2024"
+output: html_document
+---
+
+# data prep
+```{r}
+# load packages
+library(ggridges)
+library(tidyverse)
+
+# read in data
+dat <- read_csv('../data/combined.csv')
+dat_coded <- read_csv('../data/coding_text.csv')
+
+# set font for figures
+windowsFonts(tnr = windowsFont('Times New Roman'))
+windowsFonts(rbt = windowsFont('Roboto'))
+windowsFonts(fra = windowsFont('Fira Sans'))
+
+# color palette
+redBlue <- c('#407EC9', '#CE3333')
+cslPal <- c(
+  '#CE3333',  # red
+  '#E8A03E',  # orange
+  '#c2c4c4',  # grey
+  '#083D77',  # blackish
+  '#407EC9',  # blue
+  '#17C3B2',  # green
+  '#593C8F'   # purple
+  )
+
+# code republican/democrat
+dat <- dat %>%
+  mutate(party = case_when(
+    speaker == 'BIDEN' ~ 'Democrat',
+    speaker == 'BUSH' ~ 'Republican',
+    speaker == 'CLINTON' ~ 'Democrat',
+    speaker == 'KERRY' ~ 'Democrat',
+    speaker == 'MCCAIN' ~ 'Republican',
+    speaker == 'OBAMA' ~ 'Democrat',
+    speaker == 'ROMNEY' ~ 'Republican',
+    speaker == 'TRUMP' ~ 'Republican'))
+
+```
+
+# descriptives
+```{r}
+
+# summarise data by year
+tmp <- dat %>%
+  group_by(year) %>%
+  summarise(m = mean(TOXICITY, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(year = as.factor(year))
+
+# by party
+tmp <- dat %>%
+  group_by(party) %>%
+  summarise(m = mean(TOXICITY, na.rm = TRUE)) %>%
+  ungroup()
+
+# McCain vs Trump quote
+tmp <- dat %>%
+  filter(str_detect(text, 'So that means he can take the|But that does not mean that we will cease'))
+
+```
+
+
+
+
+# toxicity by year
+```{r}
+# summarise data
+tmp <- dat %>%
+  group_by(year, party) %>%
+  summarise(m = mean(TOXICITY, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(year = as.factor(year))
+
+# plot
+p <- tmp %>%
+  ggplot(., aes(x = year, y = m, group = party, fill = party)) +
+    geom_bar(stat = 'identity', position = 'dodge',
+             color = 'black', alpha = .8) +
+    scale_y_continuous(limits = c(0, .45), expand = c(0,0)) +
+    scale_fill_manual(values = redBlue) +
+    labs( 
+      title = 'Recent Debates Generally Have \nMore Toxic Language',
+      x = NULL,
+      y = 'Toxicity Rate',
+      fill = NULL,
+      caption = '\nCalifornia Social Labs'
+    ) +
+  theme_bw() +
+  theme(
+        text = element_text(family = 'fra', size = 20),
+        title = element_text(size = 18),
+        # plot.title = element_text(margin = margin(0, 0, 20, 0)),
+        plot.caption = element_text(hjust = 0, color = '#7e7e7e'),
+        axis.title.x = element_text(margin = margin(15, 0, 0, 0)),
+        axis.title.y = element_text(margin = margin(0, 15, 0, 0)),
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = 'white'),
+        # legend.key = element_rect(size = 5, color = 'white'),
+        # legend.key.size = unit(2.5, 'lines'),
+        # legend.position = 'none',
+        panel.spacing = unit(1.5, 'lines'))
+
+# save to file
+png('../figures/p1.png', units = 'in', width = 8, height = 5, res = 750)
+plot(p)
+dev.off()
+
+
+
+```
+
+
+
+
+
+# bridging vars
+
+## by year (line graph)
+```{r}
+# summarise data
+tmp <- dat %>%
+  group_by(year) %>%
+  summarise(
+    Affinity = mean(AFFINITY_EXPERIMENTAL, na.rm = TRUE),
+    Compassion = mean(COMPASSION_EXPERIMENTAL, na.rm = TRUE),
+    Curiosity = mean(CURIOSITY_EXPERIMENTAL, na.rm = TRUE),
+    Nuance = mean(NUANCE_EXPERIMENTAL, na.rm = TRUE),
+    `Personal Story` = mean(PERSONAL_STORY_EXPERIMENTAL, na.rm = TRUE),
+    Reasoning = mean(REASONING_EXPERIMENTAL, na.rm = TRUE),
+    Respect = mean(RESPECT_EXPERIMENTAL, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = c(Affinity, Compassion, Curiosity, Nuance, `Personal Story`, Reasoning, Respect),
+    names_to = 'attribute',
+    values_to = 'value') %>%
+  mutate(year = as.factor(year))
+
+
+# plot
+p <- tmp %>%
+  ggplot(., aes(x = year, y = value, group = attribute, color = attribute)) +
+    geom_point(alpha = .8, size = 4) +
+    geom_line(alpha = .6, size = 1.5) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0,0)) +
+    scale_fill_manual(values = cslPal) +
+    labs( 
+      title = 'Bridging Attributes Mostly Decreased \nOver Time',
+      x = NULL,
+      y = 'Attribute Rate',
+      color = NULL,
+      caption = '\nCalifornia Social Labs'
+    ) +
+  theme_bw() +
+  theme(
+        text = element_text(family = 'fra', size = 20),
+        title = element_text(size = 20),
+        # plot.title = element_text(margin = margin(0, 0, 20, 0)),
+        plot.caption = element_text(hjust = 0, color = '#7e7e7e'),
+        axis.title.x = element_text(margin = margin(15, 0, 0, 0)),
+        axis.title.y = element_text(margin = margin(0, 15, 0, 0)),
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = 'white'),
+        legend.key = element_rect(size = 5, color = 'white'),
+        legend.key.size = unit(2.5, 'lines'),
+        # legend.position = 'none',
+        panel.spacing = unit(1.5, 'lines'))
+
+
+# save to file
+png('../figures/p2_line.png', units = 'in', width = 8, height = 6, res = 750)
+plot(p)
+dev.off()
+
+
+```
+
+
+## by year (distribution)
+```{r}
+
+# summarise data
+tmp <- dat %>%
+  rename(
+    Affinity = AFFINITY_EXPERIMENTAL,
+    Compassion = COMPASSION_EXPERIMENTAL,
+    Curiosity = CURIOSITY_EXPERIMENTAL,
+    Nuance = NUANCE_EXPERIMENTAL,
+    `Personal Story` = PERSONAL_STORY_EXPERIMENTAL,
+    Reasoning = REASONING_EXPERIMENTAL,
+    Respect = RESPECT_EXPERIMENTAL) %>%
+  mutate(year = as.factor(year))
+
+# reshape to long format
+tmp <- tmp %>%
+  pivot_longer(
+    cols = c(Affinity, Compassion, Curiosity, Nuance, `Personal Story`, Reasoning, Respect),
+    names_to = 'var',
+    values_to = 'value'
+  ) %>%
+  select(year, debate, textId, var, value)
+
+
+# plot
+p <- tmp %>%
+  ggplot(., aes(x = value, y = fct_rev(year), fill = var)) +
+  geom_density_ridges(scale = 4, size = 1, alpha = .7) + 
+  scale_fill_manual(values = cslPal) +
+  theme_ridges() +
+  scale_y_discrete(expand = c(0, 0) ) +
+scale_x_continuous(expand = c(0, 0), limits = c(0,1), breaks = c(0, .5, 1))  +
+  labs(
+      title = 'Bridging Attributes May be Too Noisy to Detect',
+      x = NULL,
+      y = NULL,
+      fill = NULL,
+      caption = '\nCalifornia Social Labs'
+      ) +
+#  theme_ridges() +
+    theme_bw() +
+    theme(
+      text = element_text(family = 'fra', size = 22),
+      plot.title = element_text(margin = margin(0, 0, 20, 0)), 
+      #axis.title.y = element_blank(),
+      # axis.title.x = element_text(margin = margin(20, 0, 0, 0)),
+      plot.caption = element_text(hjust = 0, color = '#7e7e7e'),
+
+      axis.title.y = element_text(margin = margin(0, 20, 0, 0)), 
+      axis.ticks.y = element_blank(),
+      axis.text.x = element_text(vjust = .5),
+      axis.ticks.x = element_blank(),
+      strip.background = element_rect(fill = 'white'),
+      # legend.key = element_rect(size = 5, color = 'white'),
+     legend.position = 'none',
+      legend.key.size = unit(2.5, 'lines'),
+     panel.spacing = unit(2, 'lines'),
+     plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = 'pt')) +
+  facet_wrap(~var, ncol = 4)
+
+
+
+
+
+
+
+
+# save to file
+png('../figures/p2.png', units = 'in', width = 10, height = 8, res = 750)
+plot(p)
+dev.off()
+
+```
+
+
+# toxicity by policy
+```{r}
+
+# get top policies by year
+tmp <- dat_coded %>%
+  group_by(policy, year) %>%
+  summarise(m = mean(TOXICITY, na.rm = TRUE),
+            n = n()) %>%
+  ungroup()
+
+# remove misc, and get top 3
+tmp <- tmp %>%
+  filter(policy != 'Misc') %>%
+  group_by(year) %>% 
+  slice_max(n, n = 3, with_ties = TRUE)
+
+
+# plot
+p <- tmp %>%
+  ggplot(., aes(x = fct_rev(as.factor(year)), y = m, group = policy, fill = policy)) +
+    geom_bar(stat = 'identity', position = 'dodge',
+             color = 'black', alpha = .8) +
+    scale_y_continuous(limits = c(0, .45), expand = c(0,0)) +
+    scale_fill_manual(values = cslPal) +
+    labs( 
+      title = 'Top Policy Statements Have Mostly Become \nMore Toxic Over Time',
+      x = NULL,
+      y = 'Toxicity Rate',
+      fill = NULL,
+      caption = '\nCalifornia Social Labs'
+    ) +
+  theme_bw() +
+  coord_flip() +
+  theme(
+        text = element_text(family = 'fra', size = 20),
+        title = element_text(size = 18),
+        # plot.title = element_text(margin = margin(0, 0, 20, 0)),
+        plot.caption = element_text(hjust = 0, color = '#7e7e7e'),
+        axis.title.x = element_text(margin = margin(15, 0, 0, 0)),
+        axis.title.y = element_text(margin = margin(0, 15, 0, 0)),
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = 'white'),
+        # legend.key = element_rect(size = 5, color = 'white'),
+        # legend.key.size = unit(2.5, 'lines'),
+        # legend.position = 'none',
+        panel.spacing = unit(1.5, 'lines'))
+
+# save to file
+png('../figures/p3.png', units = 'in', width = 8, height = 5, res = 750)
+plot(p)
+dev.off()
+
+
+```
+
+
