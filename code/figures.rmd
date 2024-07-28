@@ -152,7 +152,7 @@ p <- tmp %>%
     geom_point(alpha = .8, size = 4) +
     geom_line(alpha = .6, size = 1.5) +
     scale_y_continuous(limits = c(0, 1), expand = c(0,0)) +
-    scale_fill_manual(values = cslPal) +
+    scale_color_manual(values = cslPal) +
     labs( 
       title = 'Bridging Attributes Mostly Decreased \nOver Time',
       x = NULL,
@@ -172,7 +172,7 @@ p <- tmp %>%
         axis.ticks.x = element_blank(),
         strip.background = element_rect(fill = 'white'),
         legend.key = element_rect(size = 5, color = 'white'),
-        legend.key.size = unit(2.5, 'lines'),
+        legend.key.size = unit(1.5, 'lines'),
         # legend.position = 'none',
         panel.spacing = unit(1.5, 'lines'))
 
